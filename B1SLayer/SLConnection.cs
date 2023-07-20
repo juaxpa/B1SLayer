@@ -1,4 +1,4 @@
-﻿using Flurl;
+using Flurl;
 using Flurl.Http;
 using Flurl.Http.Configuration;
 using Newtonsoft.Json;
@@ -45,6 +45,18 @@ namespace B1SLayer
         /// Gets the Service Layer root URI.
         /// </summary>
         public Uri ServiceLayerRoot { get; private set; }
+        /// <summary>
+        /// Gets the SLD Server to connect to (ProcessForce).
+        /// </summary>
+        public string SLDServer { get; private set; }
+        /// <summary>
+        /// Gets the Server Instance to connect to (ProcessForce).
+        /// </summary>
+        public string ServerInstance { get; private set; }
+        /// <summary>
+        /// Gets the Company database (schema) to connect to.
+        /// </summary>
+        public string CompanySchema { get; private set; }
         /// <summary>
         /// Gets the Company database (schema) to connect to.
         /// </summary>
@@ -105,6 +117,10 @@ namespace B1SLayer
 
             private set => _loginResponse = value;
         }
+        /// <summary>
+        /// Get/set information if the service layer we are talking to is ProcessForce or SAP
+        /// </summary>
+        private bool IsProcessForceSL = false;
         #endregion
 
         #region Constructors
@@ -149,6 +165,67 @@ namespace B1SLayer
             Password = password;
             Language = language;
             NumberOfAttempts = numberOfAttempts;
+            LoginResponse = new SLLoginResponse();
+
+            ConfigureFlurlClient();
+        }
+
+        /// <summary>
+        /// Initializes a new instance of the <see cref="SLConnection"/> class for ProcessForce.
+        /// Only one instance per company/user should be used in the application.
+        /// </summary>
+        /// <param name="serviceLayerRoot">
+        /// The Service Layer root URI. The expected format is https://[server]:[port]/b1s/[version]
+        /// </param>
+        /// /// <param name="sldServer">
+        /// The SLD Server to connect to.
+        /// </param>
+        /// /// <param name="serverInstance">
+        /// The SAP HANA server instance to connect to.
+        /// </param>
+        /// <param name="companySchema">
+        /// The Company database (schema) to connect to.
+        /// </param>
+        /// <param name="userName">
+        /// The SAP user to be used for the Service Layer authentication.
+        /// </param>
+        /// <param name="password">
+        /// The password for the provided user.
+        /// </param>
+        /// <param name="language">
+        /// The language code to be used. Specify a code if you want error messages in some specific language other than English.
+        /// A GET request to the UserLanguages resource will return all available languages and their respective codes.
+        /// </param>
+        /// <param name="numberOfAttempts">
+        /// The number of attempts for each request in case of an HTTP response code of 401, 500, 502, 503 or 504.
+        /// If the response code is 401 (Unauthorized), a login request will be performed before the new attempt.
+        /// </param>
+        public SLConnection(string serviceLayerRoot, string sldServer, string serverInstance, string companySchema, string userName, string password, int? language = null, int numberOfAttempts = 3)
+        {
+            if (string.IsNullOrWhiteSpace(sldServer))
+                throw new ArgumentException("sldServer can not be empty.");
+
+            if (string.IsNullOrWhiteSpace(serverInstance))
+                throw new ArgumentException("serverInstance can not be empty.");
+
+            if (string.IsNullOrWhiteSpace(companySchema))
+                throw new ArgumentException("companySchema can not be empty.");
+
+            if (string.IsNullOrWhiteSpace(userName))
+                throw new ArgumentException("userName can not be empty.");
+
+            if (string.IsNullOrWhiteSpace(password))
+                throw new ArgumentException("password can not be empty.");
+
+            ServiceLayerRoot = new Uri(serviceLayerRoot);
+            SLDServer = sldServer;
+            ServerInstance = serverInstance;
+            CompanySchema = companySchema;
+            UserName = userName;
+            Password = password;
+            Language = language;
+            NumberOfAttempts = numberOfAttempts;
+            IsProcessForceSL = true;
             LoginResponse = new SLLoginResponse();
 
             ConfigureFlurlClient();
@@ -331,15 +408,30 @@ namespace B1SLayer
 
                 if (!IsUsingSingleSignOn)
                 {
-                    var loginResponse = await ServiceLayerRoot
-                        .AppendPathSegment("Login")
-                        .WithCookies(out var cookieJar)
-                        .PostJsonAsync(new { CompanyDB, UserName, Password, Language })
-                        .ReceiveJson<SLLoginResponse>();
-
-                    Cookies = cookieJar;
-                    _loginResponse = loginResponse;
-                    _loginResponse.LastLogin = DateTime.Now;
+                    if (!IsProcessForceSL) // ServiceLayer SAP
+                    {
+                        var loginResponse = await ServiceLayerRoot
+                            .AppendPathSegment("Login")
+                            .WithCookies(out var cookieJar)
+                            .PostJsonAsync(new { CompanyDB, UserName, Password, Language })
+                            .ReceiveJson<SLLoginResponse>();
+                        Cookies = cookieJar;
+                        _loginResponse = loginResponse;
+                        _loginResponse.LastLogin = DateTime.Now;
+                    }
+                    else // ODATA ProcessForce
+                    {
+                        var loginResponse = await ServiceLayerRoot
+                            .AppendPathSegment("api/Login")
+                            .WithCookies(out var cookieJar)
+                            .PostJsonAsync(new { SLDServer, ServerInstance, CompanySchema, UserName, Password, Language })
+                            .ReceiveJson<SLLoginResponse>();
+                        loginResponse.SessionId = cookieJar.FirstOrDefault(x => x.Name.Equals("CTSessionId", StringComparison.OrdinalIgnoreCase))?.Value;
+                        loginResponse.SessionTimeout = 30;
+                        Cookies = cookieJar;
+                        _loginResponse = loginResponse;
+                        _loginResponse.LastLogin = DateTime.Now;
+                    }
                 }
                 else
                 {
@@ -348,7 +440,14 @@ namespace B1SLayer
                     Cookies = CreateCookieJarFromConnectionContext(connectionContext);
                     _loginResponse.LastLogin = DateTime.Now;
                     _loginResponse.SessionTimeout = _ssoSessionTimeout;
-                    _loginResponse.SessionId = Cookies.FirstOrDefault(x => x.Name.Equals("B1SESSION", StringComparison.OrdinalIgnoreCase))?.Value;
+                    if (!IsProcessForceSL)
+                    {
+                        _loginResponse.SessionId = Cookies.FirstOrDefault(x => x.Name.Equals("B1SESSION", StringComparison.OrdinalIgnoreCase))?.Value;
+                    }
+                    else
+                    {
+                        _loginResponse.SessionId = Cookies.FirstOrDefault(x => x.Name.Equals("CTSessionId", StringComparison.OrdinalIgnoreCase))?.Value;
+                    }
                 }
 
                 return expectReturn ? LoginResponse : null;
@@ -393,6 +492,10 @@ namespace B1SLayer
                 {
                     cookieJar.AddOrReplace(new FlurlCookie(cookieKeyValue[0], cookieKeyValue[1], ServiceLayerRoot.AppendPathSegment("Login")) { HttpOnly = true, Secure = true });
                 }
+                else if (cookieKeyValue[0].Equals("CTSessionId", StringComparison.OrdinalIgnoreCase))
+                {
+                    cookieJar.AddOrReplace(new FlurlCookie(cookieKeyValue[0], cookieKeyValue[1], ServiceLayerRoot.AppendPathSegment("Login")) { HttpOnly = true, Secure = true });
+                }
                 else if (cookieKeyValue[0].Equals("ROUTEID", StringComparison.OrdinalIgnoreCase))
                 {
                     cookieJar.AddOrReplace(new FlurlCookie(cookieKeyValue[0], cookieKeyValue[1], ServiceLayerRoot.AppendPathSegment("Login")) { Path = "/", Secure = true });
@@ -411,7 +514,7 @@ namespace B1SLayer
 
             try
             {
-                await ServiceLayerRoot.AppendPathSegment("Logout").WithCookies(Cookies).PostAsync();
+                await ServiceLayerRoot.AppendPathSegment((IsProcessForceSL ? "api/" : "") + "Logout").WithCookies(Cookies).PostAsync();
                 _loginResponse = new SLLoginResponse();
                 _lastRequest = default;
                 Cookies = null;
